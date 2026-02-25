@@ -1,5 +1,5 @@
 // ============================================================================
-// MULTIPLAYER TIC-TAC-TOE - Cloudflare Workers + KV Storage
+// MULTIPLAYER TIC-TAC-TOE - Cloudflare Workers + KV Storage + Queue
 // ============================================================================
 
 interface GameState {
@@ -10,6 +10,8 @@ interface GameState {
   gameOver: boolean;
   lastUpdate: number;
 }
+
+const QUEUE_KEY = "matchmaking_queue";
 
 export default {
   async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
@@ -26,6 +28,12 @@ export default {
     }
     if (url.pathname === "/api/reset") {
       return handleReset(request, url, env);
+    }
+    if (url.pathname === "/api/queue") {
+      return handleQueue(request, url, env);
+    }
+    if (url.pathname === "/api/leave-queue") {
+      return handleLeaveQueue(request, url, env);
     }
 
     if (url.pathname === "/" || url.pathname === "/index.html") {
@@ -59,32 +67,98 @@ async function saveGame(gameId: string, game: GameState, env: Env) {
   await env.GAME_STATE.put(gameId, JSON.stringify(game));
 }
 
+// Queue management
+async function getQueue(env: Env): Promise<string[]> {
+  const queue = await env.GAME_STATE.get(QUEUE_KEY, "json");
+  return queue || [];
+}
+
+async function addToQueue(env: Env, gameId: string) {
+  const queue = await getQueue(env);
+  if (!queue.includes(gameId)) {
+    queue.push(gameId);
+    await env.GAME_STATE.put(QUEUE_KEY, JSON.stringify(queue));
+  }
+}
+
+async function removeFromQueue(env: Env, gameId: string) {
+  const queue = await getQueue(env);
+  const newQueue = queue.filter(id => id !== gameId);
+  await env.GAME_STATE.put(QUEUE_KEY, JSON.stringify(newQueue));
+}
+
+async function popFromQueue(env: Env): Promise<string | null> {
+  const queue = await getQueue(env);
+  if (queue.length === 0) return null;
+  const nextGameId = queue.shift()!;
+  await env.GAME_STATE.put(QUEUE_KEY, JSON.stringify(queue));
+  return nextGameId;
+}
+
 async function handleJoin(request: Request, url: URL, env: Env): Promise<Response> {
   const gameId = url.searchParams.get("game") || "default";
-  const game = await getGame(gameId, env);
+  const playerId = url.searchParams.get("playerId");
 
-  let playerSymbol: string | null = null;
-  if (game.players.length === 0) playerSymbol = "X";
-  else if (game.players.length === 1) playerSymbol = "O";
-
-  if (!playerSymbol) {
-    return Response.json({ error: "Game full" }, { status: 400 });
+  // If playerId provided, rejoin existing game
+  if (playerId) {
+    const game = await env.GAME_STATE.get(gameId, "json") as GameState | null;
+    if (game && game.players.find(p => p.id === playerId)) {
+      return Response.json({
+        playerId,
+        symbol: game.players.find(p => p.id === playerId)!.symbol,
+        state: sanitizeState(game),
+        inQueue: false,
+      });
+    }
   }
 
-  const playerId = crypto.randomUUID().slice(0, 8);
-  game.players.push({ id: playerId, symbol: playerSymbol });
-  await saveGame(gameId, game, env);
+  const game = await getGame(gameId, env);
+
+  // Check if game has room
+  if (game.players.length < 2) {
+    let playerSymbol: string | null = null;
+    if (game.players.length === 0) playerSymbol = "X";
+    else if (game.players.length === 1) playerSymbol = "O";
+
+    const newPlayerId = crypto.randomUUID().slice(0, 8);
+    game.players.push({ id: newPlayerId, symbol: playerSymbol! });
+    await saveGame(gameId, game, env);
+
+    return Response.json({
+      playerId: newPlayerId,
+      symbol: playerSymbol,
+      state: sanitizeState(game),
+      inQueue: false,
+    });
+  }
+
+  // Game full - add to queue
+  const queueId = crypto.randomUUID().slice(0, 8);
+  await addToQueue(env, queueId);
 
   return Response.json({
-    playerId,
-    symbol: playerSymbol,
-    state: sanitizeState(game),
+    playerId: queueId,
+    symbol: null,
+    state: null,
+    inQueue: true,
+    queuePosition: (await getQueue(env)).indexOf(queueId) + 1,
   });
 }
 
 async function handlePoll(request: Request, url: URL, env: Env): Promise<Response> {
   const gameId = url.searchParams.get("game") || "default";
+  const playerId = url.searchParams.get("playerId") || "";
   const since = parseInt(url.searchParams.get("since") || "0");
+
+  // Check if in queue
+  const queue = await getQueue(env);
+  if (queue.includes(playerId)) {
+    const position = queue.indexOf(playerId) + 1;
+    return Response.json({
+      inQueue: true,
+      queuePosition: position,
+    });
+  }
 
   const game = await env.GAME_STATE.get(gameId, "json") as GameState | null;
   if (!game) {
@@ -92,10 +166,10 @@ async function handlePoll(request: Request, url: URL, env: Env): Promise<Respons
   }
 
   if (game.lastUpdate > since) {
-    return Response.json({ state: sanitizeState(game) });
+    return Response.json({ state: sanitizeState(game), inQueue: false });
   }
 
-  return Response.json({ state: sanitizeState(game) });
+  return Response.json({ state: sanitizeState(game), inQueue: false });
 }
 
 async function handleMove(request: Request, url: URL, env: Env): Promise<Response> {
@@ -143,18 +217,93 @@ async function handleMove(request: Request, url: URL, env: Env): Promise<Respons
 
 async function handleReset(request: Request, url: URL, env: Env): Promise<Response> {
   const gameId = url.searchParams.get("game") || "default";
+  const playerId = url.searchParams.get("playerId") || "";
 
-  const game: GameState = {
-    players: [],
-    board: Array(9).fill(null),
-    turn: "X",
-    winner: null,
-    gameOver: false,
-    lastUpdate: Date.now(),
-  };
+  const game = await env.GAME_STATE.get(gameId, "json") as GameState | null;
+  if (!game) {
+    return Response.json({ error: "Game not found" }, { status: 400 });
+  }
+
+  const player = game.players.find(p => p.id === playerId);
+  if (!player) {
+    return Response.json({ error: "Player not found" }, { status: 400 });
+  }
+
+  // Check if winner clicked reset
+  if (!game.gameOver || (game.winner !== player.symbol && game.winner !== "draw")) {
+    return Response.json({ error: "Only winner can start new game" }, { status: 400 });
+  }
+
+  // Check queue for next opponent
+  const nextGameId = await popFromQueue(env);
+
+  if (nextGameId) {
+    // Match with queued player - create new game
+    const newGameId = crypto.randomUUID().slice(0, 8);
+    const newGame: GameState = {
+      players: [
+        { id: playerId, symbol: "X" },
+        { id: nextGameId, symbol: "O" },
+      ],
+      board: Array(9).fill(null),
+      turn: "X",
+      winner: null,
+      gameOver: false,
+      lastUpdate: Date.now(),
+    };
+    await env.GAME_STATE.put(newGameId, JSON.stringify(newGame));
+
+    return Response.json({
+      state: sanitizeState(newGame),
+      newGameId: newGameId,
+      message: "Matched with queued player!",
+    });
+  }
+
+  // No queue - restart with current players
+  game.board = Array(9).fill(null);
+  game.turn = "X";
+  game.winner = null;
+  game.gameOver = false;
   await saveGame(gameId, game, env);
 
-  return Response.json({ state: sanitizeState(game) });
+  return Response.json({
+    state: sanitizeState(game),
+    newGameId: gameId,
+    message: "New game started",
+  });
+}
+
+async function handleQueue(request: Request, url: URL, env: Env): Promise<Response> {
+  const playerId = url.searchParams.get("playerId") || "";
+
+  if (!playerId) {
+    return Response.json({ error: "Player ID required" }, { status: 400 });
+  }
+
+  await addToQueue(env, playerId);
+  const queue = await getQueue(env);
+
+  return Response.json({
+    inQueue: true,
+    queuePosition: queue.indexOf(playerId) + 1,
+    queueLength: queue.length,
+  });
+}
+
+async function handleLeaveQueue(request: Request, url: URL, env: Env): Promise<Response> {
+  const playerId = url.searchParams.get("playerId") || "";
+
+  if (!playerId) {
+    return Response.json({ error: "Player ID required" }, { status: 400 });
+  }
+
+  await removeFromQueue(env, playerId);
+
+  return Response.json({
+    inQueue: false,
+    message: "Left queue",
+  });
 }
 
 function sanitizeState(game: GameState) {
@@ -216,19 +365,30 @@ function getHTML(origin: string): string {
     .cell.winner { background: #00d26a; }
     .cell.X { color: #00d4ff; }
     .cell.O { color: #ff6b6b; }
+    .controls { display: flex; gap: 10px; margin-bottom: 20px; }
     button { padding: 12px 24px; font-size: 1rem; border: none; border-radius: 8px; cursor: pointer; }
     .btn-reset { background: #e94560; color: white; }
     .btn-reset:hover { background: #ff6b8a; }
+    .btn-queue { background: #00d26a; color: white; }
+    .btn-queue:hover { background: #00f57a; }
+    .btn-leave { background: #666; color: white; }
     .info { margin-top: 20px; color: #888; font-size: 0.9rem; }
     .error { color: #e94560; margin-bottom: 10px; }
+    .queue-status { color: #00d26a; font-size: 1.1rem; margin-bottom: 15px; }
+    .hidden { display: none; }
   </style>
 </head>
 <body>
   <h1>Tic-Tac-Toe</h1>
   <div class="error" id="error"></div>
+  <div class="queue-status hidden" id="queueStatus"></div>
   <div class="status" id="status">Connecting...</div>
   <div class="board" id="board"></div>
-  <div class="controls"><button class="btn-reset" id="resetBtn">New Game</button></div>
+  <div class="controls">
+    <button class="btn-reset hidden" id="resetBtn">New Game</button>
+    <button class="btn-queue hidden" id="queueBtn">Find Match</button>
+    <button class="btn-leave hidden" id="leaveBtn">Leave Queue</button>
+  </div>
   <div class="info">You are: <span id="mySymbol">-</span></div>
 
   <script>
@@ -237,13 +397,18 @@ function getHTML(origin: string): string {
     let myPlayerId = null;
     let mySymbol = null;
     let lastUpdate = 0;
+    let inQueue = false;
     let gameState = { board: Array(9).fill(null), turn: 'X', winner: null, gameOver: false };
+    let currentGameId = GAME_ID;
 
     const boardEl = document.getElementById('board');
     const statusEl = document.getElementById('status');
     const mySymbolEl = document.getElementById('mySymbol');
     const errorEl = document.getElementById('error');
+    const queueStatusEl = document.getElementById('queueStatus');
     const resetBtn = document.getElementById('resetBtn');
+    const queueBtn = document.getElementById('queueBtn');
+    const leaveBtn = document.getElementById('leaveBtn');
 
     for (let i = 0; i < 9; i++) {
       const cell = document.createElement('div');
@@ -255,41 +420,104 @@ function getHTML(origin: string): string {
 
     async function join() {
       try {
-        const resp = await fetch(API_BASE + '/api/join?game=' + GAME_ID);
+        const resp = await fetch(API_BASE + '/api/join?game=' + currentGameId + (myPlayerId ? '&playerId=' + myPlayerId : ''));
         const data = await resp.json();
+        
         if (data.error) { errorEl.textContent = data.error; return; }
+        
+        if (data.inQueue) {
+          inQueue = true;
+          myPlayerId = data.playerId;
+          updateQueueUI(data.queuePosition);
+          setInterval(poll, 1000);
+          return;
+        }
+
+        inQueue = false;
         myPlayerId = data.playerId;
         mySymbol = data.symbol;
         mySymbolEl.textContent = data.symbol;
         gameState = data.state;
         lastUpdate = Date.now();
-        render();
+        updateGameUI();
         setInterval(poll, 1000);
-      } catch (e) { errorEl.textContent = 'Connection failed. Retrying...'; setTimeout(join, 2000); }
+      } catch (e) { 
+        errorEl.textContent = 'Connection failed. Retrying...'; 
+        setTimeout(join, 2000); 
+      }
     }
 
     async function poll() {
       try {
-        const resp = await fetch(API_BASE + '/api/poll?game=' + GAME_ID + '&since=' + lastUpdate);
+        const resp = await fetch(API_BASE + '/api/poll?game=' + currentGameId + '&playerId=' + myPlayerId + '&since=' + lastUpdate);
         const data = await resp.json();
-        if (data.state) { gameState = data.state; lastUpdate = Date.now(); render(); }
+        
+        if (data.inQueue) {
+          inQueue = true;
+          updateQueueUI(data.queuePosition);
+          return;
+        }
+
+        if (data.state) {
+          // Check if new game started
+          if (data.newGameId && data.newGameId !== currentGameId) {
+            currentGameId = data.newGameId;
+            if (data.message) errorEl.textContent = data.message;
+          }
+          gameState = data.state;
+          lastUpdate = Date.now();
+          updateGameUI();
+        }
       } catch (e) { console.error('Poll error:', e); }
     }
 
     async function makeMove(index) {
       if (gameState.board[index] || gameState.gameOver || gameState.turn !== mySymbol) return;
       try {
-        const resp = await fetch(API_BASE + '/api/move?game=' + GAME_ID + '&playerId=' + myPlayerId + '&index=' + index);
+        const resp = await fetch(API_BASE + '/api/move?game=' + currentGameId + '&playerId=' + myPlayerId + '&index=' + index);
         const data = await resp.json();
         if (data.error) errorEl.textContent = data.error;
       } catch (e) { console.error('Move error:', e); }
     }
 
     async function reset() {
-      try { await fetch(API_BASE + '/api/reset?game=' + GAME_ID); } catch (e) { console.error('Reset error:', e); }
+      try { 
+        const resp = await fetch(API_BASE + '/api/reset?game=' + currentGameId + '&playerId=' + myPlayerId);
+        const data = await resp.json();
+        if (data.error) { errorEl.textContent = data.error; return; }
+        if (data.newGameId) {
+          currentGameId = data.newGameId;
+          if (data.message) errorEl.textContent = data.message;
+        }
+      } catch (e) { console.error('Reset error:', e); }
     }
 
-    function render() {
+    async function joinQueue() {
+      try {
+        const resp = await fetch(API_BASE + '/api/queue?playerId=' + myPlayerId);
+        const data = await resp.json();
+        if (data.inQueue) {
+          inQueue = true;
+          updateQueueUI(data.queuePosition);
+        }
+      } catch (e) { console.error('Queue error:', e); }
+    }
+
+    async function leaveQueue() {
+      try {
+        await fetch(API_BASE + '/api/leave-queue?playerId=' + myPlayerId);
+        inQueue = false;
+        join();
+      } catch (e) { console.error('Leave queue error:', e); }
+    }
+
+    function updateGameUI() {
+      // Show/hide buttons based on game state
+      resetBtn.classList.toggle('hidden', !gameState.gameOver || gameState.winner === 'draw');
+      queueBtn.classList.toggle('hidden', gameState.gameOver);
+      leaveBtn.classList.add('hidden');
+
+      // Render board
       const cells = document.querySelectorAll('.cell');
       cells.forEach((cell, i) => {
         const val = gameState.board[i];
@@ -297,7 +525,9 @@ function getHTML(origin: string): string {
         cell.className = 'cell' + (val ? ' taken ' + val : '');
         cell.classList.toggle('winner', gameState.winner && gameState.board[i] === gameState.winner);
       });
+      
       errorEl.textContent = '';
+      
       if (gameState.gameOver) {
         if (gameState.winner === 'draw') statusEl.textContent = "It's a draw!";
         else if (gameState.winner === mySymbol) statusEl.textContent = '🎉 You win!';
@@ -307,7 +537,19 @@ function getHTML(origin: string): string {
       }
     }
 
+    function updateQueueUI(position) {
+      queueStatusEl.classList.remove('hidden');
+      queueStatusEl.textContent = 'In queue... Position: ' + position;
+      boardEl.classList.add('hidden');
+      resetBtn.classList.add('hidden');
+      queueBtn.classList.add('hidden');
+      leaveBtn.classList.remove('hidden');
+      statusEl.textContent = 'Waiting for opponent...';
+    }
+
     resetBtn.addEventListener('click', reset);
+    queueBtn.addEventListener('click', joinQueue);
+    leaveBtn.addEventListener('click', leaveQueue);
     join();
   </script>
 </body>
