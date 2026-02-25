@@ -347,6 +347,7 @@ async function handleReset(request: Request, url: URL, env: Env): Promise<Respon
     const player2Id = queue.shift()!;
     await env.GAME_STATE.put(QUEUE_KEY, JSON.stringify(queue));
 
+    // Create new game for the queued players
     const newGameId = crypto.randomUUID().slice(0, 8);
     const newGame: GameState = {
       players: [
@@ -367,13 +368,20 @@ async function handleReset(request: Request, url: URL, env: Env): Promise<Respon
     await removeQueuedPlayer(env, player1Id);
     await removeQueuedPlayer(env, player2Id);
 
-    // Also restart current game for winner
-    game.board = Array(9).fill(null);
-    game.turn = "X";
-    game.winner = null;
-    game.gameOver = false;
-    game.rematchInProgress = false;
-    await saveGame(gameId, game, env);
+    // Restart current game for winner with remaining player (if any)
+    const remainingPlayers = game.players.filter(p => p.symbol !== game.winner);
+    if (remainingPlayers.length > 0) {
+      const loser = remainingPlayers[0];
+      game.board = Array(9).fill(null);
+      game.turn = "X";
+      game.winner = null;
+      game.gameOver = false;
+      game.rematchInProgress = false;
+      await saveGame(gameId, game, env);
+    } else {
+      // No remaining player, delete the old game
+      await env.GAME_STATE.delete(gameId);
+    }
 
     return Response.json({
       state: sanitizeState(game),
@@ -384,14 +392,17 @@ async function handleReset(request: Request, url: URL, env: Env): Promise<Respon
 
   // If only 1 in queue, match winner with that player
   if (queue.length === 1) {
-    const nextGameId = queue.shift()!;
+    const nextPlayerId = queue.shift()!;
     await env.GAME_STATE.put(QUEUE_KEY, JSON.stringify(queue));
 
-    const newGameId = crypto.randomUUID().slice(0, 8);
+    // Clear old game and create new one with winner + queued player
+    const winner = game.players.find(p => p.symbol === game.winner)!;
+    
+    // Create new game
     const newGame: GameState = {
       players: [
-        { id: playerId, symbol: "X" },
-        { id: nextGameId, symbol: "O" },
+        { id: winner.id, symbol: "X" },
+        { id: nextPlayerId, symbol: "O" },
       ],
       board: Array(9).fill(null),
       turn: "X",
@@ -399,23 +410,21 @@ async function handleReset(request: Request, url: URL, env: Env): Promise<Respon
       gameOver: false,
       lastUpdate: Date.now(),
     };
+    
+    // Save new game
+    const newGameId = crypto.randomUUID().slice(0, 8);
     await env.GAME_STATE.put(newGameId, JSON.stringify(newGame));
+    
+    // Clear the old game
+    await env.GAME_STATE.delete(gameId);
 
     // Register match so queued player can find this game
-    await setPlayerMatch(env, nextGameId, newGameId);
-    await removeQueuedPlayer(env, nextGameId);
-
-    // Restart current game
-    game.board = Array(9).fill(null);
-    game.turn = "X";
-    game.winner = null;
-    game.gameOver = false;
-    game.rematchInProgress = false;
-    await saveGame(gameId, game, env);
+    await setPlayerMatch(env, nextPlayerId, newGameId);
+    await removeQueuedPlayer(env, nextPlayerId);
 
     return Response.json({
-      state: sanitizeState(game),
-      newGameId: gameId,
+      state: sanitizeState(newGame),
+      newGameId: newGameId,
       message: "Matched with queued player!",
     });
   }
