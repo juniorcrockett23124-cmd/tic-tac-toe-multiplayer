@@ -12,6 +12,8 @@ interface GameState {
 }
 
 const QUEUE_KEY = "matchmaking_queue";
+const MATCHES_KEY = "player_matches"; // playerId -> gameId mapping
+const QUEUED_PLAYERS_KEY = "queued_players"; // playerId -> {timestamp} mapping
 
 export default {
   async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
@@ -34,6 +36,9 @@ export default {
     }
     if (url.pathname === "/api/leave-queue") {
       return handleLeaveQueue(request, url, env);
+    }
+    if (url.pathname === "/api/admin/clear-queue") {
+      return handleClearQueue(env);
     }
 
     if (url.pathname === "/" || url.pathname === "/index.html") {
@@ -95,12 +100,85 @@ async function popFromQueue(env: Env): Promise<string | null> {
   return nextGameId;
 }
 
+// Player to game mapping
+async function getPlayerMatch(env: Env, playerId: string): Promise<string | null> {
+  const matches = await env.GAME_STATE.get(MATCHES_KEY, "json") as Record<string, string> | null;
+  return matches?.[playerId] || null;
+}
+
+async function setPlayerMatch(env: Env, playerId: string, gameId: string) {
+  const matches = (await env.GAME_STATE.get(MATCHES_KEY, "json") as Record<string, string>) || {};
+  matches[playerId] = gameId;
+  await env.GAME_STATE.put(MATCHES_KEY, JSON.stringify(matches));
+}
+
+async function clearPlayerMatch(env: Env, playerId: string) {
+  const matches = (await env.GAME_STATE.get(MATCHES_KEY, "json") as Record<string, string>) || {};
+  delete matches[playerId];
+  await env.GAME_STATE.put(MATCHES_KEY, JSON.stringify(matches));
+}
+
+// Track queued players (for session persistence)
+async function getQueuedPlayers(env: Env): Promise<Record<string, number>> {
+  return (await env.GAME_STATE.get(QUEUED_PLAYERS_KEY, "json")) || {};
+}
+
+async function setQueuedPlayer(env: Env, playerId: string) {
+  const queued = await getQueuedPlayers(env);
+  queued[playerId] = Date.now();
+  await env.GAME_STATE.put(QUEUED_PLAYERS_KEY, JSON.stringify(queued));
+}
+
+async function removeQueuedPlayer(env: Env, playerId: string) {
+  const queued = await getQueuedPlayers(env);
+  delete queued[playerId];
+  await env.GAME_STATE.put(QUEUED_PLAYERS_KEY, JSON.stringify(queued));
+}
+
 async function handleJoin(request: Request, url: URL, env: Env): Promise<Response> {
   const gameId = url.searchParams.get("game") || "default";
   const playerId = url.searchParams.get("playerId");
 
-  // If playerId provided, rejoin existing game
+  // If playerId provided, check for existing session
   if (playerId) {
+    // Check if player has a pending match
+    const matchedGameId = await getPlayerMatch(env, playerId);
+    if (matchedGameId) {
+      const game = await env.GAME_STATE.get(matchedGameId, "json") as GameState | null;
+      if (game) {
+        await clearPlayerMatch(env, playerId);
+        const player = game.players.find(p => p.id === playerId);
+        return Response.json({
+          playerId,
+          symbol: player?.symbol || null,
+          state: sanitizeState(game),
+          inQueue: false,
+          newGameId: matchedGameId,
+        });
+      }
+    }
+    
+    // Check if player is in the queue - if so, re-add to queue (refresh queue position)
+    const queuedPlayers = await getQueuedPlayers(env);
+    if (queuedPlayers[playerId]) {
+      // Player was in queue, re-add them (removes stale position, adds fresh)
+      const queue = await getQueue(env);
+      // Remove if exists, then add
+      const newQueue = queue.filter(id => id !== playerId);
+      newQueue.push(playerId);
+      await env.GAME_STATE.put(QUEUE_KEY, JSON.stringify(newQueue));
+      await setQueuedPlayer(env, playerId);
+      
+      return Response.json({
+        playerId,
+        symbol: null,
+        state: null,
+        inQueue: true,
+        queuePosition: newQueue.length,
+      });
+    }
+    
+    // Check if player is already in this game
     const game = await env.GAME_STATE.get(gameId, "json") as GameState | null;
     if (game && game.players.find(p => p.id === playerId)) {
       return Response.json({
@@ -133,15 +211,17 @@ async function handleJoin(request: Request, url: URL, env: Env): Promise<Respons
   }
 
   // Game full - add to queue
-  const queueId = crypto.randomUUID().slice(0, 8);
-  await addToQueue(env, queueId);
+  // Use provided playerId or generate new one
+  const queuePlayerId = playerId || crypto.randomUUID().slice(0, 8);
+  await addToQueue(env, queuePlayerId);
+  await setQueuedPlayer(env, queuePlayerId);
 
   return Response.json({
-    playerId: queueId,
+    playerId: queuePlayerId,
     symbol: null,
     state: null,
     inQueue: true,
-    queuePosition: (await getQueue(env)).indexOf(queueId) + 1,
+    queuePosition: (await getQueue(env)).indexOf(queuePlayerId) + 1,
   });
 }
 
@@ -234,8 +314,87 @@ async function handleReset(request: Request, url: URL, env: Env): Promise<Respon
     return Response.json({ error: "Only winner can start new game" }, { status: 400 });
   }
 
-  // Check queue for next opponent
-  const nextGameId = await popFromQueue(env);
+  // Check queue for next opponents
+  const queue = await getQueue(env);
+
+  // If 2+ in queue, match first 2 to start their own game
+  if (queue.length >= 2) {
+    const player1Id = queue.shift()!;
+    const player2Id = queue.shift()!;
+    await env.GAME_STATE.put(QUEUE_KEY, JSON.stringify(queue));
+
+    const newGameId = crypto.randomUUID().slice(0, 8);
+    const newGame: GameState = {
+      players: [
+        { id: player1Id, symbol: "X" },
+        { id: player2Id, symbol: "O" },
+      ],
+      board: Array(9).fill(null),
+      turn: "X",
+      winner: null,
+      gameOver: false,
+      lastUpdate: Date.now(),
+    };
+    await env.GAME_STATE.put(newGameId, JSON.stringify(newGame));
+
+    // Register matches so players can find this game
+    await setPlayerMatch(env, player1Id, newGameId);
+    await setPlayerMatch(env, player2Id, newGameId);
+    await removeQueuedPlayer(env, player1Id);
+    await removeQueuedPlayer(env, player2Id);
+
+    // Also restart current game for winner
+    game.board = Array(9).fill(null);
+    game.turn = "X";
+    game.winner = null;
+    game.gameOver = false;
+    await saveGame(gameId, game, env);
+
+    return Response.json({
+      state: sanitizeState(game),
+      newGameId: gameId,
+      message: "Queue matched 2 players! Your game restarted.",
+    });
+  }
+
+  // If only 1 in queue, match winner with that player
+  if (queue.length === 1) {
+    const nextGameId = queue.shift()!;
+    await env.GAME_STATE.put(QUEUE_KEY, JSON.stringify(queue));
+
+    const newGameId = crypto.randomUUID().slice(0, 8);
+    const newGame: GameState = {
+      players: [
+        { id: playerId, symbol: "X" },
+        { id: nextGameId, symbol: "O" },
+      ],
+      board: Array(9).fill(null),
+      turn: "X",
+      winner: null,
+      gameOver: false,
+      lastUpdate: Date.now(),
+    };
+    await env.GAME_STATE.put(newGameId, JSON.stringify(newGame));
+
+    // Register match so queued player can find this game
+    await setPlayerMatch(env, nextGameId, newGameId);
+    await removeQueuedPlayer(env, nextGameId);
+
+    // Restart current game
+    game.board = Array(9).fill(null);
+    game.turn = "X";
+    game.winner = null;
+    game.gameOver = false;
+    await saveGame(gameId, game, env);
+
+    return Response.json({
+      state: sanitizeState(game),
+      newGameId: gameId,
+      message: "Matched with queued player!",
+    });
+  }
+
+  // No queue - restart with current players
 
   if (nextGameId) {
     // Match with queued player - create new game
@@ -303,6 +462,14 @@ async function handleLeaveQueue(request: Request, url: URL, env: Env): Promise<R
   return Response.json({
     inQueue: false,
     message: "Left queue",
+  });
+}
+
+async function handleClearQueue(env: Env): Promise<Response> {
+  await env.GAME_STATE.delete(QUEUE_KEY);
+  return Response.json({
+    success: true,
+    message: "Queue cleared",
   });
 }
 
