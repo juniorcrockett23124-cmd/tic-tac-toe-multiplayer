@@ -9,6 +9,7 @@ interface GameState {
   winner: string | null;
   gameOver: boolean;
   lastUpdate: number;
+  rematchInProgress?: boolean; // Lock to prevent double rematch
 }
 
 const QUEUE_KEY = "matchmaking_queue";
@@ -39,6 +40,9 @@ export default {
     }
     if (url.pathname === "/api/admin/clear-queue") {
       return handleClearQueue(env);
+    }
+    if (url.pathname === "/api/admin/reset-all") {
+      return handleResetAll(env);
     }
 
     if (url.pathname === "/" || url.pathname === "/index.html") {
@@ -309,16 +313,36 @@ async function handleReset(request: Request, url: URL, env: Env): Promise<Respon
     return Response.json({ error: "Player not found" }, { status: 400 });
   }
 
-  // Check if winner clicked reset
-  if (!game.gameOver || (game.winner !== player.symbol && game.winner !== "draw")) {
-    return Response.json({ error: "Only winner can start new game" }, { status: 400 });
+  // Check if game is over (winner or draw)
+  if (!game.gameOver) {
+    return Response.json({ error: "Game not over" }, { status: 400 });
   }
+
+  // Check if a rematch is already in progress
+  if (game.rematchInProgress) {
+    return Response.json({ error: "Rematch already in progress" }, { status: 400 });
+  }
+
+  const isDraw = game.winner === "draw";
+  const isWinner = game.winner === player.symbol;
+
+  // Only winner or either player on draw can take action
+  if (!isWinner && !isDraw) {
+    return Response.json({ error: "Only winner or players in draw can start new game" }, { status: 400 });
+  }
+
+  // Mark as rematch in progress to prevent double-processing
+  game.rematchInProgress = true;
+  await saveGame(gameId, game, env);
+
+  // Check if this is a queue request or rematch
+  const action = url.searchParams.get("action") || "rematch";
 
   // Check queue for next opponents
   const queue = await getQueue(env);
 
-  // If 2+ in queue, match first 2 to start their own game
-  if (queue.length >= 2) {
+  // If 2+ in queue and action is queue, match first 2 to start their own game
+  if (action === "queue" && queue.length >= 2) {
     const player1Id = queue.shift()!;
     const player2Id = queue.shift()!;
     await env.GAME_STATE.put(QUEUE_KEY, JSON.stringify(queue));
@@ -348,6 +372,7 @@ async function handleReset(request: Request, url: URL, env: Env): Promise<Respon
     game.turn = "X";
     game.winner = null;
     game.gameOver = false;
+    game.rematchInProgress = false;
     await saveGame(gameId, game, env);
 
     return Response.json({
@@ -385,6 +410,7 @@ async function handleReset(request: Request, url: URL, env: Env): Promise<Respon
     game.turn = "X";
     game.winner = null;
     game.gameOver = false;
+    game.rematchInProgress = false;
     await saveGame(gameId, game, env);
 
     return Response.json({
@@ -394,42 +420,33 @@ async function handleReset(request: Request, url: URL, env: Env): Promise<Respon
     });
   }
 
-  // No queue - restart with current players
-
-  if (nextGameId) {
-    // Match with queued player - create new game
-    const newGameId = crypto.randomUUID().slice(0, 8);
-    const newGame: GameState = {
-      players: [
-        { id: playerId, symbol: "X" },
-        { id: nextGameId, symbol: "O" },
-      ],
-      board: Array(9).fill(null),
-      turn: "X",
-      winner: null,
-      gameOver: false,
-      lastUpdate: Date.now(),
-    };
-    await env.GAME_STATE.put(newGameId, JSON.stringify(newGame));
-
+  // No queue available - handle based on action
+  if (action === "queue") {
     return Response.json({
-      state: sanitizeState(newGame),
-      newGameId: newGameId,
-      message: "Matched with queued player!",
+      state: sanitizeState(game),
+      message: "No players in queue. Use Rematch to play again!",
     });
   }
 
-  // No queue - restart with current players
+  // Default: rematch - restart with current players (randomize who starts)
+  const rematchStarter = Math.random() > 0.5 ? "X" : "O";
+  const players = game.players.map(p => ({
+    id: p.id,
+    symbol: p.id === playerId ? rematchStarter : (rematchStarter === "X" ? "O" : "X")
+  }));
+  
+  game.players = players;
   game.board = Array(9).fill(null);
   game.turn = "X";
   game.winner = null;
   game.gameOver = false;
+  game.rematchInProgress = false;
   await saveGame(gameId, game, env);
 
   return Response.json({
     state: sanitizeState(game),
     newGameId: gameId,
-    message: "New game started",
+    message: "Rematch! " + rematchStarter + " starts",
   });
 }
 
@@ -467,9 +484,22 @@ async function handleLeaveQueue(request: Request, url: URL, env: Env): Promise<R
 
 async function handleClearQueue(env: Env): Promise<Response> {
   await env.GAME_STATE.delete(QUEUE_KEY);
+  await env.GAME_STATE.delete(QUEUED_PLAYERS_KEY);
+  await env.GAME_STATE.delete(MATCHES_KEY);
   return Response.json({
     success: true,
     message: "Queue cleared",
+  });
+}
+
+async function handleResetAll(env: Env): Promise<Response> {
+  await env.GAME_STATE.delete(QUEUE_KEY);
+  await env.GAME_STATE.delete(QUEUED_PLAYERS_KEY);
+  await env.GAME_STATE.delete(MATCHES_KEY);
+  await env.GAME_STATE.delete("default");
+  return Response.json({
+    success: true,
+    message: "All cleared",
   });
 }
 
@@ -552,8 +582,8 @@ function getHTML(origin: string): string {
   <div class="status" id="status">Connecting...</div>
   <div class="board" id="board"></div>
   <div class="controls">
-    <button class="btn-reset hidden" id="resetBtn">New Game</button>
-    <button class="btn-queue hidden" id="queueBtn">Find Match</button>
+    <button class="btn-reset hidden" id="resetBtn">Rematch</button>
+    <button class="btn-queue hidden" id="queueBtn">Find New Match</button>
     <button class="btn-leave hidden" id="leaveBtn">Leave Queue</button>
   </div>
   <div class="info">You are: <span id="mySymbol">-</span></div>
@@ -649,24 +679,29 @@ function getHTML(origin: string): string {
 
     async function reset() {
       try { 
-        const resp = await fetch(API_BASE + '/api/reset?game=' + currentGameId + '&playerId=' + myPlayerId);
+        // Default: rematch
+        const resp = await fetch(API_BASE + '/api/reset?game=' + currentGameId + '&playerId=' + myPlayerId + '&action=rematch');
         const data = await resp.json();
         if (data.error) { errorEl.textContent = data.error; return; }
         if (data.newGameId) {
           currentGameId = data.newGameId;
-          if (data.message) errorEl.textContent = data.message;
         }
+        if (data.message) errorEl.textContent = data.message;
+        poll();
       } catch (e) { console.error('Reset error:', e); }
     }
 
     async function joinQueue() {
       try {
-        const resp = await fetch(API_BASE + '/api/queue?playerId=' + myPlayerId);
+        // Call reset with action=queue to find a new match
+        const resp = await fetch(API_BASE + '/api/reset?game=' + currentGameId + '&playerId=' + myPlayerId + '&action=queue');
         const data = await resp.json();
-        if (data.inQueue) {
-          inQueue = true;
-          updateQueueUI(data.queuePosition);
+        if (data.error) { errorEl.textContent = data.error; return; }
+        if (data.newGameId && data.newGameId !== currentGameId) {
+          currentGameId = data.newGameId;
         }
+        if (data.message) errorEl.textContent = data.message;
+        poll();
       } catch (e) { console.error('Queue error:', e); }
     }
 
@@ -680,8 +715,10 @@ function getHTML(origin: string): string {
 
     function updateGameUI() {
       // Show/hide buttons based on game state
-      resetBtn.classList.toggle('hidden', !gameState.gameOver || gameState.winner === 'draw');
-      queueBtn.classList.toggle('hidden', gameState.gameOver);
+      // Both rematch and queue buttons show when game is over (winner or draw)
+      const showButtons = gameState.gameOver;
+      resetBtn.classList.toggle('hidden', !showButtons);
+      queueBtn.classList.toggle('hidden', !showButtons);
       leaveBtn.classList.add('hidden');
 
       // Render board
