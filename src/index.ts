@@ -10,6 +10,7 @@ interface GameState {
   gameOver: boolean;
   lastUpdate: number;
   rematchInProgress?: boolean; // Lock to prevent double rematch
+  lastStarter?: string; // Track who started last game (for alternating after draw)
 }
 
 const QUEUE_KEY = "matchmaking_queue";
@@ -395,10 +396,10 @@ async function handleReset(request: Request, url: URL, env: Env): Promise<Respon
     const nextPlayerId = queue.shift()!;
     await env.GAME_STATE.put(QUEUE_KEY, JSON.stringify(queue));
 
-    // Clear old game and create new one with winner + queued player
+    // Winner plays as X against queued player (O)
     const winner = game.players.find(p => p.symbol === game.winner)!;
     
-    // Create new game
+    // Create new game - winner is X
     const newGame: GameState = {
       players: [
         { id: winner.id, symbol: "X" },
@@ -437,8 +438,19 @@ async function handleReset(request: Request, url: URL, env: Env): Promise<Respon
     });
   }
 
-  // Default: rematch - restart with current players (randomize who starts)
-  const rematchStarter = Math.random() > 0.5 ? "X" : "O";
+  // Default: rematch - restart with current players
+  // After WIN: winner starts (X)
+  // After DRAW: alternate who starts
+  let rematchStarter: string;
+  
+  if (isDraw) {
+    // Alternate: if last game started with X, now start with O
+    rematchStarter = game.lastStarter === "X" ? "O" : "X";
+  } else {
+    // Winner always starts
+    rematchStarter = "X";
+  }
+  
   const players = game.players.map(p => ({
     id: p.id,
     symbol: p.id === playerId ? rematchStarter : (rematchStarter === "X" ? "O" : "X")
@@ -449,6 +461,7 @@ async function handleReset(request: Request, url: URL, env: Env): Promise<Respon
   game.turn = "X";
   game.winner = null;
   game.gameOver = false;
+  game.lastStarter = rematchStarter;
   game.rematchInProgress = false;
   await saveGame(gameId, game, env);
 
