@@ -1,15 +1,9 @@
-name = "tic-tac-toe-v2"
+name = "tic-tac-toe-v3"
 main = "src/index.ts"
 compatibility_date = "2026-02-25"
 
-[[durable_objects.bindings]]
-name = "GAME"
-class_name = "Game"
-script_name = "tic-tac-toe-v2"
+[[kv_namespaces]]
+binding = "GAME_STATE"
+id = "66a2053c888a44f7b1cf44c30ee2084a"
 
-[[migrations]]
-tag = "v1"
-new_sqlite_classes = ["Game"]
-
-[observability]
-enabled = true
+observability = { enabled = true }

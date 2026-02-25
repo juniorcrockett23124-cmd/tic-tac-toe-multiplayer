@@ -1,32 +1,190 @@
-import { DurableObject } from "cloudflare:workers";
-
 // ============================================================================
-// DURABLE OBJECT: Game State Manager
+// MULTIPLAYER TIC-TAC-TOE - Cloudflare Workers + KV Storage
 // ============================================================================
-export class Game implements DurableObject {
-  constructor(readonly ctx: DurableObjectState, env: Env) {}
 
-  async fetch(request: Request): Promise<Response> {
+interface GameState {
+  players: { id: string; symbol: string }[];
+  board: (string | null)[];
+  turn: string;
+  winner: string | null;
+  gameOver: boolean;
+  lastUpdate: number;
+}
+
+export default {
+  async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
     const url = new URL(request.url);
 
-    // WebSocket upgrade for players
-    if (url.pathname === "/ws") {
-      return this.handleWebSocket(request);
+    if (url.pathname === "/api/join") {
+      return handleJoin(request, url, env);
+    }
+    if (url.pathname === "/api/poll") {
+      return handlePoll(request, url, env);
+    }
+    if (url.pathname === "/api/move") {
+      return handleMove(request, url, env);
+    }
+    if (url.pathname === "/api/reset") {
+      return handleReset(request, url, env);
     }
 
-    // Serve the HTML with the worker URL injected
     if (url.pathname === "/" || url.pathname === "/index.html") {
-      return new Response(this.getHTML(url.origin), {
+      return new Response(getHTML(url.origin), {
         headers: { "Content-Type": "text/html" },
       });
     }
 
     return new Response("Not Found", { status: 404 });
+  },
+};
+
+async function getGame(gameId: string, env: Env): Promise<GameState> {
+  const existing = await env.GAME_STATE.get(gameId, "json");
+  if (existing) return existing;
+
+  const newGame: GameState = {
+    players: [],
+    board: Array(9).fill(null),
+    turn: "X",
+    winner: null,
+    gameOver: false,
+    lastUpdate: Date.now(),
+  };
+  await env.GAME_STATE.put(gameId, JSON.stringify(newGame));
+  return newGame;
+}
+
+async function saveGame(gameId: string, game: GameState, env: Env) {
+  game.lastUpdate = Date.now();
+  await env.GAME_STATE.put(gameId, JSON.stringify(game));
+}
+
+async function handleJoin(request: Request, url: URL, env: Env): Promise<Response> {
+  const gameId = url.searchParams.get("game") || "default";
+  const game = await getGame(gameId, env);
+
+  let playerSymbol: string | null = null;
+  if (game.players.length === 0) playerSymbol = "X";
+  else if (game.players.length === 1) playerSymbol = "O";
+
+  if (!playerSymbol) {
+    return Response.json({ error: "Game full" }, { status: 400 });
   }
 
-  private getHTML(origin: string): string {
-    const workerUrl = origin.startsWith("http") ? origin : `https://${origin}`;
-    return `<!DOCTYPE html>
+  const playerId = crypto.randomUUID().slice(0, 8);
+  game.players.push({ id: playerId, symbol: playerSymbol });
+  await saveGame(gameId, game, env);
+
+  return Response.json({
+    playerId,
+    symbol: playerSymbol,
+    state: sanitizeState(game),
+  });
+}
+
+async function handlePoll(request: Request, url: URL, env: Env): Promise<Response> {
+  const gameId = url.searchParams.get("game") || "default";
+  const since = parseInt(url.searchParams.get("since") || "0");
+
+  const game = await env.GAME_STATE.get(gameId, "json") as GameState | null;
+  if (!game) {
+    return Response.json({ state: null });
+  }
+
+  if (game.lastUpdate > since) {
+    return Response.json({ state: sanitizeState(game) });
+  }
+
+  return Response.json({ state: sanitizeState(game) });
+}
+
+async function handleMove(request: Request, url: URL, env: Env): Promise<Response> {
+  const gameId = url.searchParams.get("game") || "default";
+  const playerId = url.searchParams.get("playerId") || "";
+  const index = parseInt(url.searchParams.get("index") || "-1");
+
+  const game = await env.GAME_STATE.get(gameId, "json") as GameState | null;
+  if (!game) {
+    return Response.json({ error: "Game not found" }, { status: 400 });
+  }
+
+  const player = game.players.find(p => p.id === playerId);
+  if (!player) {
+    return Response.json({ error: "Player not found" }, { status: 400 });
+  }
+
+  if (game.gameOver) {
+    return Response.json({ error: "Game over" }, { status: 400 });
+  }
+
+  if (player.symbol !== game.turn) {
+    return Response.json({ error: "Not your turn" }, { status: 400 });
+  }
+
+  if (index < 0 || index > 8 || game.board[index] !== null) {
+    return Response.json({ error: "Invalid move" }, { status: 400 });
+  }
+
+  game.board[index] = player.symbol;
+  game.turn = player.symbol === "X" ? "O" : "X";
+
+  const winner = checkWinner(game.board);
+  if (winner) {
+    game.winner = winner;
+    game.gameOver = true;
+  } else if (!game.board.includes(null)) {
+    game.winner = "draw";
+    game.gameOver = true;
+  }
+
+  await saveGame(gameId, game, env);
+  return Response.json({ state: sanitizeState(game) });
+}
+
+async function handleReset(request: Request, url: URL, env: Env): Promise<Response> {
+  const gameId = url.searchParams.get("game") || "default";
+
+  const game: GameState = {
+    players: [],
+    board: Array(9).fill(null),
+    turn: "X",
+    winner: null,
+    gameOver: false,
+    lastUpdate: Date.now(),
+  };
+  await saveGame(gameId, game, env);
+
+  return Response.json({ state: sanitizeState(game) });
+}
+
+function sanitizeState(game: GameState) {
+  return {
+    players: game.players.map(p => ({ id: p.id, symbol: p.symbol })),
+    board: game.board,
+    turn: game.turn,
+    winner: game.winner,
+    gameOver: game.gameOver,
+  };
+}
+
+function checkWinner(board: (string | null)[]): string | null {
+  const lines = [
+    [0, 1, 2], [3, 4, 5], [6, 7, 8],
+    [0, 3, 6], [1, 4, 7], [2, 5, 8],
+    [0, 4, 8], [2, 4, 6]
+  ];
+  for (const [a, b, c] of lines) {
+    if (board[a] && board[a] === board[b] && board[a] === board[c]) {
+      return board[a];
+    }
+  }
+  return null;
+}
+
+function getHTML(origin: string): string {
+  const workerUrl = origin.startsWith("http") ? origin : `https://${origin}`;
+  const apiBase = workerUrl;
+  return `<!DOCTYPE html>
 <html lang="en">
 <head>
   <meta charset="UTF-8">
@@ -47,71 +205,44 @@ export class Game implements DurableObject {
     }
     h1 { margin-bottom: 10px; }
     .status { margin-bottom: 20px; font-size: 1.2rem; }
-    .board {
-      display: grid;
-      grid-template-columns: repeat(3, 100px);
-      gap: 10px;
-      margin-bottom: 20px;
-    }
+    .board { display: grid; grid-template-columns: repeat(3, 100px); gap: 10px; margin-bottom: 20px; }
     .cell {
-      width: 100px;
-      height: 100px;
-      background: #0f3460;
-      border-radius: 10px;
-      display: flex;
-      align-items: center;
-      justify-content: center;
-      font-size: 3rem;
-      font-weight: bold;
-      cursor: pointer;
-      transition: all 0.2s;
+      width: 100px; height: 100px; background: #0f3460; border-radius: 10px;
+      display: flex; align-items: center; justify-content: center;
+      font-size: 3rem; font-weight: bold; cursor: pointer; transition: all 0.2s;
     }
     .cell:hover:not(.taken) { background: #1a4a7a; }
     .cell.taken { cursor: not-allowed; }
     .cell.winner { background: #00d26a; }
     .cell.X { color: #00d4ff; }
     .cell.O { color: #ff6b6b; }
-    .controls { display: flex; gap: 10px; }
-    button {
-      padding: 12px 24px;
-      font-size: 1rem;
-      border: none;
-      border-radius: 8px;
-      cursor: pointer;
-      transition: all 0.2s;
-    }
+    button { padding: 12px 24px; font-size: 1rem; border: none; border-radius: 8px; cursor: pointer; }
     .btn-reset { background: #e94560; color: white; }
     .btn-reset:hover { background: #ff6b8a; }
     .info { margin-top: 20px; color: #888; font-size: 0.9rem; }
-    .connected { color: #00d26a; }
-    .disconnected { color: #e94560; }
+    .error { color: #e94560; margin-bottom: 10px; }
   </style>
 </head>
 <body>
   <h1>Tic-Tac-Toe</h1>
-  <div class="status" id="status">
-    <span class="disconnected">Connecting...</span>
-  </div>
+  <div class="error" id="error"></div>
+  <div class="status" id="status">Connecting...</div>
   <div class="board" id="board"></div>
-  <div class="controls">
-    <button class="btn-reset" id="resetBtn">New Game</button>
-  </div>
-  <div class="info">
-    <span id="connectionStatus" class="disconnected">Disconnected</span> | 
-    You are: <span id="mySymbol">-</span>
-  </div>
+  <div class="controls"><button class="btn-reset" id="resetBtn">New Game</button></div>
+  <div class="info">You are: <span id="mySymbol">-</span></div>
 
   <script>
-    const BOARD_URL = '${workerUrl}';
-    let ws = null;
+    const API_BASE = '${apiBase}';
+    const GAME_ID = 'default';
     let myPlayerId = null;
     let mySymbol = null;
+    let lastUpdate = 0;
     let gameState = { board: Array(9).fill(null), turn: 'X', winner: null, gameOver: false };
 
     const boardEl = document.getElementById('board');
     const statusEl = document.getElementById('status');
     const mySymbolEl = document.getElementById('mySymbol');
-    const connectionStatusEl = document.getElementById('connectionStatus');
+    const errorEl = document.getElementById('error');
     const resetBtn = document.getElementById('resetBtn');
 
     for (let i = 0; i < 9; i++) {
@@ -122,56 +253,40 @@ export class Game implements DurableObject {
       boardEl.appendChild(cell);
     }
 
-    function connect() {
-      const wsUrl = BOARD_URL.replace('https://', 'wss://') + '/ws';
-      ws = new WebSocket(wsUrl);
-
-      ws.onopen = () => {
-        connectionStatusEl.textContent = 'Connected';
-        connectionStatusEl.className = 'connected';
-      };
-
-      ws.onmessage = (event) => {
-        const data = JSON.parse(event.data);
-        
-        if (data.type === 'welcome') {
-          myPlayerId = data.playerId;
-          mySymbol = data.symbol;
-          mySymbolEl.textContent = data.symbol;
-          gameState = data.state;
-          render();
-        }
-        
-        if (data.type === 'state') {
-          gameState = {
-            board: data.board,
-            turn: data.turn,
-            winner: data.winner,
-            gameOver: data.gameOver
-          };
-          render();
-        }
-
-        if (data.type === 'error') {
-          alert(data.message);
-        }
-      };
-
-      ws.onclose = () => {
-        connectionStatusEl.textContent = 'Disconnected';
-        connectionStatusEl.className = 'disconnected';
-        setTimeout(connect, 3000);
-      };
+    async function join() {
+      try {
+        const resp = await fetch(API_BASE + '/api/join?game=' + GAME_ID);
+        const data = await resp.json();
+        if (data.error) { errorEl.textContent = data.error; return; }
+        myPlayerId = data.playerId;
+        mySymbol = data.symbol;
+        mySymbolEl.textContent = data.symbol;
+        gameState = data.state;
+        lastUpdate = Date.now();
+        render();
+        setInterval(poll, 1000);
+      } catch (e) { errorEl.textContent = 'Connection failed. Retrying...'; setTimeout(join, 2000); }
     }
 
-    function makeMove(index) {
-      if (!gameState.board[index] && !gameState.gameOver && gameState.turn === mySymbol) {
-        ws.send(JSON.stringify({ type: 'move', index }));
-      }
+    async function poll() {
+      try {
+        const resp = await fetch(API_BASE + '/api/poll?game=' + GAME_ID + '&since=' + lastUpdate);
+        const data = await resp.json();
+        if (data.state) { gameState = data.state; lastUpdate = Date.now(); render(); }
+      } catch (e) { console.error('Poll error:', e); }
     }
 
-    function reset() {
-      ws.send(JSON.stringify({ type: 'reset' }));
+    async function makeMove(index) {
+      if (gameState.board[index] || gameState.gameOver || gameState.turn !== mySymbol) return;
+      try {
+        const resp = await fetch(API_BASE + '/api/move?game=' + GAME_ID + '&playerId=' + myPlayerId + '&index=' + index);
+        const data = await resp.json();
+        if (data.error) errorEl.textContent = data.error;
+      } catch (e) { console.error('Move error:', e); }
+    }
+
+    async function reset() {
+      try { await fetch(API_BASE + '/api/reset?game=' + GAME_ID); } catch (e) { console.error('Reset error:', e); }
     }
 
     function render() {
@@ -182,194 +297,23 @@ export class Game implements DurableObject {
         cell.className = 'cell' + (val ? ' taken ' + val : '');
         cell.classList.toggle('winner', gameState.winner && gameState.board[i] === gameState.winner);
       });
-
+      errorEl.textContent = '';
       if (gameState.gameOver) {
-        if (gameState.winner === 'draw') {
-          statusEl.textContent = "It's a draw!";
-        } else if (gameState.winner === mySymbol) {
-          statusEl.textContent = '🎉 You win!';
-        } else if (gameState.winner) {
-          statusEl.textContent = gameState.winner + ' wins!';
-        }
+        if (gameState.winner === 'draw') statusEl.textContent = "It's a draw!";
+        else if (gameState.winner === mySymbol) statusEl.textContent = '🎉 You win!';
+        else if (gameState.winner) statusEl.textContent = gameState.winner + ' wins!';
       } else {
-        const isMyTurn = gameState.turn === mySymbol;
-        statusEl.textContent = isMyTurn ? 'Your turn' : 'Waiting for ' + gameState.turn + '...';
+        statusEl.textContent = gameState.turn === mySymbol ? 'Your turn' : 'Waiting for ' + gameState.turn + '...';
       }
     }
 
     resetBtn.addEventListener('click', reset);
-    connect();
+    join();
   </script>
 </body>
 </html>`;
-  }
-
-  private async handleWebSocket(request: Request): Promise<Response> {
-    const pair = new WebSocketPair();
-    const client = pair[0];
-    const server = pair[1];
-
-    const playerId = crypto.randomUUID().slice(0, 8);
-
-    let state = await this.ctx.storage.get<any>("state");
-    if (!state) {
-      state = {
-        players: [],
-        board: Array(9).fill(null),
-        turn: "X",
-        winner: null,
-        gameOver: false,
-      };
-    }
-
-    const playerSymbol = state.players.length === 0 ? "X" : "O";
-    const player = { id: playerId, symbol: playerSymbol, ws: server as any };
-    state.players.push(player);
-
-    await this.ctx.storage.put("state", state);
-
-    server.send(JSON.stringify({
-      type: "welcome",
-      playerId,
-      symbol: playerSymbol,
-      state: this.sanitizeState(state),
-    }));
-
-    this.broadcastState(state);
-
-    server.addEventListener("message", async (event) => {
-      try {
-        const data = JSON.parse(event.data as string);
-        await this.handleMessage(player, data);
-      } catch (e) {
-        console.error("Message error:", e);
-      }
-    });
-
-    server.addEventListener("close", async () => {
-      await this.handleDisconnect(player);
-    });
-
-    return new Response(null, { status: 101, webSocket: client });
-  }
-
-  private async handleMessage(player: any, data: any) {
-    let state = await this.ctx.storage.get<any>("state");
-    if (!state || state.gameOver) return;
-
-    if (data.type === "move") {
-      const { index } = data;
-
-      if (state.turn !== player.symbol) {
-        player.ws.send(JSON.stringify({ type: "error", message: "Not your turn" }));
-        return;
-      }
-
-      if (state.board[index] !== null) {
-        player.ws.send(JSON.stringify({ type: "error", message: "Invalid move" }));
-        return;
-      }
-
-      state.board[index] = player.symbol;
-      state.turn = player.symbol === "X" ? "O" : "X";
-
-      const winner = this.checkWinner(state.board);
-      if (winner) {
-        state.winner = winner;
-        state.gameOver = true;
-      } else if (!state.board.includes(null)) {
-        state.winner = "draw";
-        state.gameOver = true;
-      }
-
-      await this.ctx.storage.put("state", state);
-      this.broadcastState(state);
-    }
-
-    if (data.type === "reset") {
-      state = {
-        players: state.players,
-        board: Array(9).fill(null),
-        turn: "X",
-        winner: null,
-        gameOver: false,
-      };
-      await this.ctx.storage.put("state", state);
-      this.broadcastState(state);
-    }
-  }
-
-  private async handleDisconnect(player: any) {
-    let state = await this.ctx.storage.get<any>("state");
-    if (!state) return;
-
-    state.players = state.players.filter((p: any) => p.id !== player.id);
-    await this.ctx.storage.put("state", state);
-
-    this.broadcastState(state);
-  }
-
-  private broadcastState(state: any) {
-    const sanitized = this.sanitizeState(state);
-    const message = JSON.stringify({ type: "state", ...sanitized });
-
-    for (const player of state.players) {
-      try {
-        player.ws.send(message);
-      } catch (e) {}
-    }
-  }
-
-  private sanitizeState(state: any) {
-    return {
-      players: state.players.map((p: any) => ({ id: p.id, symbol: p.symbol })),
-      board: state.board,
-      turn: state.turn,
-      winner: state.winner,
-      gameOver: state.gameOver,
-    };
-  }
-
-  private checkWinner(board: string[]): string | null {
-    const lines = [
-      [0, 1, 2], [3, 4, 5], [6, 7, 8],
-      [0, 3, 6], [1, 4, 7], [2, 5, 8],
-      [0, 4, 8], [2, 4, 6],
-    ];
-
-    for (const [a, b, c] of lines) {
-      if (board[a] && board[a] === board[b] && board[a] === board[c]) {
-        return board[a];
-      }
-    }
-    return null;
-  }
 }
 
-// ============================================================================
-// MAIN WORKER
-// ============================================================================
-export default {
-  async fetch(request: Request, env: Env): Promise<Response> {
-    const url = new URL(request.url);
-
-    if (url.pathname === "/ws") {
-      const doId = env.GAME.idFromName("tic-tac-toe-global");
-      const stub = env.GAME.get(doId);
-      return stub.fetch(request);
-    }
-
-    // Serve HTML from root
-    if (url.pathname === "/" || url.pathname === "/index.html") {
-      const doId = env.GAME.idFromName("tic-tac-toe-global");
-      const stub = env.GAME.get(doId);
-      return stub.fetch(request);
-    }
-
-    return new Response("Not Found", { status: 404 });
-  },
-};
-
 interface Env {
-  GAME: DurableObjectNamespace;
+  GAME_STATE: KVNamespace;
 }
