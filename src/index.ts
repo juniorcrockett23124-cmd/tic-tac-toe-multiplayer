@@ -662,6 +662,14 @@ function getHTML(origin: string): string {
             if (data.message) errorEl.textContent = data.message;
           }
           gameState = data.state;
+          
+          // Update mySymbol if player list changed (e.g., after rematch)
+          const me = gameState.players.find(p => p.id === myPlayerId);
+          if (me) {
+            mySymbol = me.symbol;
+            mySymbolEl.textContent = mySymbol;
+          }
+          
           lastUpdate = Date.now();
           updateGameUI();
         }
