@@ -216,8 +216,8 @@ async function handleWebSocket(request: Request, env: Env): Promise<Response> {
   
   // Create WebSocket pair
   const pair = new WebSocketPair();
-  const clientWs = pair[1];
   const serverWs = pair[0];
+  const clientWs = pair[1];
 
   // Create session for this client
   const session: Session = {
@@ -253,12 +253,12 @@ async function handleWebSocket(request: Request, env: Env): Promise<Response> {
   const client: Client = {
     id: clientId,
     session,
-    ws: clientWs,
+    ws: serverWs,
   };
   clients.set(clientId, client);
 
   // Handle messages
-  clientWs.addEventListener("message", async (event) => {
+  serverWs.addEventListener("message", async (event) => {
     try {
       const data = JSON.parse(event.data as string);
       await handleClientMessage(client, data, env);
@@ -268,7 +268,7 @@ async function handleWebSocket(request: Request, env: Env): Promise<Response> {
   });
 
   // Handle close
-  clientWs.addEventListener("close", async () => {
+  serverWs.addEventListener("close", async () => {
     console.log(`Client ${clientId} disconnected`);
     clients.delete(clientId);
     session.connected = false;
@@ -290,7 +290,7 @@ async function handleWebSocket(request: Request, env: Env): Promise<Response> {
   });
 
   // Send welcome
-  clientWs.send(JSON.stringify({
+  serverWs.send(JSON.stringify({
     type: "welcome",
     playerId: session.playerId,
     symbol: session.symbol,
@@ -300,7 +300,7 @@ async function handleWebSocket(request: Request, env: Env): Promise<Response> {
     resumed: !!existingSession,
   }));
 
-  return new Response(null, { status: 101, webSocket: serverWs });
+  return new Response(null, { status: 101, webSocket: clientWs });
 }
 
 async function handleClientMessage(client: Client, data: any, env: Env) {
