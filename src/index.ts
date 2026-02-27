@@ -357,17 +357,29 @@ async function handleClientMessage(client: Client, data: any, env: Env) {
 async function findMatchForClient(client: Client, env: Env) {
   const { session, ws } = client;
   const queue = await getQueue(env);
-  
-  const waitingClientId = queue.find(id => id !== session.clientId);
-  
-  if (waitingClientId && clients.has(waitingClientId)) {
-    const opponentClient = clients.get(waitingClientId)!;
-    
-    const gameId = "game_" + Date.now() + "_" + Math.random().toString(36).slice(2, 6);
+
+  // Remove self from queue first (avoid duplicates)
+  const filteredQueue = queue.filter(id => id !== session.clientId);
+
+  if (filteredQueue.length > 0) {
+    const opponentClientId = filteredQueue[0];
+
+    // Create game
+    const gameId =
+      "game_" + Date.now() + "_" + Math.random().toString(36).slice(2, 6);
+
     const game: GameState = {
       players: [
-        { id: opponentClient.session.playerId || generatePlayerId(), symbol: "X", clientId: waitingClientId, username: opponentClient.session.username },
-        { id: session.playerId || generatePlayerId(), symbol: "O", clientId: session.clientId, username: session.username },
+        {
+          id: generatePlayerId(),
+          symbol: "X",
+          clientId: opponentClientId,
+        },
+        {
+          id: generatePlayerId(),
+          symbol: "O",
+          clientId: session.clientId,
+        },
       ],
       board: Array(9).fill(null),
       turn: "X",
@@ -375,45 +387,61 @@ async function findMatchForClient(client: Client, env: Env) {
       gameOver: false,
       lastUpdate: Date.now(),
     };
-    
-    if (!session.playerId) session.playerId = game.players[1].id;
-    if (!opponentClient.session.playerId) opponentClient.session.playerId = game.players[0].id;
-    
+
     await saveGame(gameId, game, env);
-    
+
+    // Update sessions in KV
+    const opponentSession = await getSession(env, opponentClientId);
+
+    if (opponentSession) {
+      opponentSession.gameId = gameId;
+      opponentSession.symbol = "X";
+      opponentSession.inQueue = false;
+      await saveSession(env, opponentClientId, opponentSession);
+    }
+
     session.gameId = gameId;
-    session.inQueue = false;
     session.symbol = "O";
-    opponentClient.session.gameId = gameId;
-    opponentClient.session.inQueue = false;
-    opponentClient.session.symbol = "X";
-    
-    await removeFromQueue(env, waitingClientId);
+    session.inQueue = false;
     await saveSession(env, session.clientId, session);
-    await saveSession(env, opponentClient.session.clientId, opponentClient.session);
-    
-    ws.send(JSON.stringify({
-      type: "game_start",
-      symbol: "O",
-      state: await getGameState(gameId, env),
-    }));
-    
-    opponentClient.ws.send(JSON.stringify({
-      type: "game_start",
-      symbol: "X",
-      state: await getGameState(gameId, env),
-    }));
-    
+
+    // Remove opponent from queue
+    await removeFromQueue(env, opponentClientId);
+
+    // Notify current player
+    ws.send(
+      JSON.stringify({
+        type: "game_start",
+        symbol: "O",
+        state: await getGameState(gameId, env),
+      })
+    );
+
+    // If opponent is connected on THIS isolate, notify
+    const opponentClient = clients.get(opponentClientId);
+    if (opponentClient) {
+      opponentClient.ws.send(
+        JSON.stringify({
+          type: "game_start",
+          symbol: "X",
+          state: await getGameState(gameId, env),
+        })
+      );
+    }
+
   } else {
+    // No opponent → add to queue
     await addToQueue(env, session.clientId);
     session.inQueue = true;
     await saveSession(env, session.clientId, session);
-    
-    ws.send(JSON.stringify({
-      type: "queue_update",
-      inQueue: true,
-      position: (await getQueue(env)).indexOf(session.clientId) + 1,
-    }));
+
+    ws.send(
+      JSON.stringify({
+        type: "queue_update",
+        inQueue: true,
+        position: (await getQueue(env)).indexOf(session.clientId) + 1,
+      })
+    );
   }
 }
 
