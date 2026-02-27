@@ -1,5 +1,10 @@
-node_modules/
-dist/
+# Root level
 .DS_Store
 .openclaw/
 *.log
+
+# In projects
+projects/*/node_modules/
+projects/*/dist/
+projects/*/.wrangler/
+projects/*/.env

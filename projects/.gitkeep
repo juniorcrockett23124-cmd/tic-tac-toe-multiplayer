@@ -1,0 +1,15 @@
+# Projects Directory
+
+This directory contains all project-specific code.
+
+## Structure
+
+```
+projects/
+├── project-name/
+│   ├── src/
+│   ├── package.json
+│   └── ...
+```
+
+Each project has its own dependencies, build config, and deployment setup.
