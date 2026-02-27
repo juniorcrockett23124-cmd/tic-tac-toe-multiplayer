@@ -36,6 +36,11 @@ interface Client {
   ws: WebSocket;
 }
 
+// Cloudflare Workers Environment binding
+interface Env {
+  GAME_STATE: KVNamespace;
+}
+
 const QUEUE_KEY = "matchmaking_queue";
 const SESSIONS_KEY = "active_sessions";
 
