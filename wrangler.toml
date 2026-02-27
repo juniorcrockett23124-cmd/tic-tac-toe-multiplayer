@@ -1,0 +1,11 @@
+name = "tic-tac-toe-v4"
+main = "src/worker.ts"
+compatibility_date = "2024-01-01"
+
+[[durable_objects.bindings]]
+name = "TICTACTOE_GAME"
+class_name = "TicTacToeGame"
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["TicTacToeGame"]
